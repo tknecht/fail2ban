@@ -1,4 +1,4 @@
-# emacs: -*- mode: python; py-indent-offset: 4; indent-tabs-mode: t :
+# emacs: -*- mode: python; py-indent-offset: 4; indent-tabs-mode: t -*-
 # vi: set ft=python sts=4 ts=4 sw=4 noet :
 
 # This file is part of Fail2Ban.
@@ -57,12 +57,12 @@ class XarfV4Action(ActionBase):
 			reporter_org=None, reporter_contact=None, reporter_domain=None,
 			sender_org=None, sender_contact=None, sender_domain=None,
 			service="unspecified", port="0", protocol="tcp",
-			sender=None, mailcmd="/usr/sbin/sendmail",
-			resolver="abuse-contacts.abusix.org", matches="ipmatches",
-			source_port_regex=r"\bport (\d{1,5})\b"):
+			sender=None, mailcmd="/usr/sbin/sendmail", mailargs=None,
+			resolver="abuse-contacts.abusix.org", matches="ipmatches"):
 		# reporter_*/sender_* are the XARF v4 report identities; the separate
 		# `sender` arg is the e-mail envelope From address (self.envelope_from).
 		super(XarfV4Action, self).__init__(jail, name)
+		from fail2ban.server.ipdns import DNSUtils
 		self.reporter = {"org": reporter_org, "contact": reporter_contact,
 			"domain": reporter_domain}
 		self.sender_id = {"org": sender_org, "contact": sender_contact,
@@ -70,12 +70,13 @@ class XarfV4Action(ActionBase):
 		self.service = service
 		self.port = port
 		self.protocol = protocol
-		self.envelope_from = sender or ("fail2ban@" + socket.getfqdn())
+		self.envelope_from = sender or ("fail2ban@" + DNSUtils.getHostname())
 		self.mailcmd = mailcmd
+		# default envelope-sender flag so SPF/DMARC can align with envelope_from;
+		# operators can override entirely via mailargs.
+		self.mailargs = mailargs if mailargs is not None else ("-f " + self.envelope_from)
 		self.resolver = resolver
 		self.matches = matches
-		self.source_port_regex = source_port_regex
-		self._source_port_cre = re.compile(source_port_regex) if source_port_regex else None
 		# bypass ban/unban for restored tickets
 		self.norestored = 1
 
@@ -170,30 +171,56 @@ class XarfV4Action(ActionBase):
 	def _iso(self, epoch):
 		return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(epoch)))
 
-	def _extract_source_port(self, text):
+	def _extract_source_port(self, text, ip):
 		"""Best-effort: extract the attacker source port from matched log text.
 
 		fail2ban generally knows only the attacked (destination) port; some
-		services (e.g. sshd) log the source port in the failure line. When
-		present, the most recent (triggering) match is used. Returns an int
-		in 1..65535, or None when unavailable.
+		services (e.g. sshd) log the source port in the failure line. The
+		pattern is anchored to the banned IP itself, since a single log line
+		can name more than one "<addr> port <n>" pair - e.g. sshd's verbose
+		"Connection from <ip> port 51353 on 127.0.0.1 port 22" also names the
+		local listening port, which is not the attacker's port. When present,
+		the most recent (triggering) match is used. Returns an int in
+		1..65535, or None when unavailable.
 		"""
-		if not self._source_port_cre or not text:
+		if not text:
 			return None
-		for val in reversed(self._source_port_cre.findall(text)):
+		cre = re.compile(
+			r'\b' + re.escape(str(ip)) + r'\s+port\s+(\d{1,5})\b')
+		matches = cre.findall(text)
+		if not matches:
+			return None
+		try:
+			p = int(matches[-1])
+		except (TypeError, ValueError):
+			return None
+		return p if 1 <= p <= 65535 else None
+
+	def _resolve_port(self, port):
+		"""Best-effort parse of fail2ban's `port` option into a single XARF
+		v4 `destination_port`.
+
+		`port` may be a service name (``ssh``), a comma-separated list
+		(``http,https``) or a colon/dash range (``0:65535``); XARF v4 wants
+		one numeric port in 1..65535, so anything else is treated as unknown
+		(``None``) rather than guessed at.
+		"""
+		if not port:
+			return None
+		first = str(port).split(',', 1)[0].strip()
+		if not first or ':' in first or '-' in first:
+			return None
+		try:
+			p = int(first)
+		except (TypeError, ValueError):
 			try:
-				p = int(val)
-			except (TypeError, ValueError):
-				continue
-			if 1 <= p <= 65535:
-				return p
-		return None
+				p = socket.getservbyname(first)
+			except OSError:
+				return None
+		return p if 1 <= p <= 65535 else None
 
 	def _aInfoToData(self, aInfo):
-		try:
-			dport = int(self.port)
-		except (TypeError, ValueError):
-			dport = None
+		dport = self._resolve_port(self.port)
 		ts = self._iso(aInfo.get('time') or time.time())
 		evidence = aInfo.get(self.matches) or aInfo.get('matches') or ''
 		failures = aInfo.get('failures')
@@ -211,13 +238,14 @@ class XarfV4Action(ActionBase):
 		}
 		if dport is not None:
 			data["destination_port"] = dport
-		sport = self._extract_source_port(evidence)
+		sport = self._extract_source_port(evidence, aInfo['ip'])
 		if sport is not None:
 			data["source_port"] = sport
 		return data
 
 	def _sendmail(self, recipients, msg):
-		cmd = shlex.split(self.mailcmd) + ['--'] + list(recipients)
+		cmd = (shlex.split(self.mailcmd) + shlex.split(self.mailargs)
+			+ ['--'] + list(recipients))
 		p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
 		try:
 			p.communicate(msg.as_bytes(), timeout=30)
@@ -240,6 +268,13 @@ class XarfV4Action(ActionBase):
 				"set reporter_org/contact/domain and sender_org/contact/"
 				"domain - skipping report", self._name)
 			return
+		if not (aInfo.get(self.matches) or aInfo.get('matches')):
+			# e.g. a manual `fail2ban-client set <jail> banip <ip>` ticket:
+			# no log evidence to report and nothing to substantiate a claim.
+			self._logSys.info(
+				"xarf action %s: no evidence for %s (manual ban?); skipping "
+				"report", self._name, aInfo.get('ip'))
+			return
 		contacts = self._resolveAbuseContacts(str(aInfo['ip']))
 		if not contacts:
 			self._logSys.info(
@@ -249,6 +284,14 @@ class XarfV4Action(ActionBase):
 		try:
 			data = self._aInfoToData(aInfo)
 			report = xarfreport.build_login_attack(data)
+			if report is None:
+				# the xarf library validated the report and rejected it as
+				# schema-invalid; sending it unvalidated would be worse than
+				# not reporting at all.
+				self._logSys.warning(
+					"xarf action %s: report for %s failed schema "
+					"validation; not sending", self._name, aInfo.get('ip'))
+				return
 			msg = self._build_email(report)
 			msg["To"] = ", ".join(contacts)
 			self._sendmail(contacts, msg)

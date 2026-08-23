@@ -103,7 +103,7 @@ ver. 1.1.1 (2026/08/15) - triple-one-win
 
 ### Deprecations
 * `action.d/xarf-login-attack.conf` - deprecated (emits obsolete x-arf 0.2);
-  superseded by the `xarf` action (XARF v4). Will be removed in a future release.
+  superseded by the `xarf` action (XARF v4). Will be removed in a future release (gh-3820)
 
 ### New Features and Enhancements
 * `fail2ban-server` supports `systemd` socket activation (`sd_listen_fds(3)`); optional `fail2ban.socket` unit provided
@@ -152,7 +152,7 @@ ver. 1.1.1 (2026/08/15) - triple-one-win
   (https://xarf.org) by e-mail to the IP's abuse contact (resolved via the
   Abusix Contact DB). Uses the optional `xarf` python package for schema
   validation when installed, otherwise a built-in stdlib generator. Enable
-  via `action_xarf_v4` in jail.conf.
+  via `action_xarf_v4` in jail.conf (gh-3820)
 
 
 ver. 1.1.0 (2024/04/25) - object-found--norad-59479-cospar-2024-069a--altitude-36267km
