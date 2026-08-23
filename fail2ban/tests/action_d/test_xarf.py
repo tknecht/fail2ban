@@ -23,7 +23,10 @@ __license__ = "GPL"
 
 import base64
 import hashlib
+import importlib
 import os
+import subprocess
+import sys
 import unittest
 
 from ...server import xarfreport
@@ -142,6 +145,50 @@ class XarfBuildLoginAttackTest(XarfLoginAttackStdlibTest):
 		finally:
 			xarfreport._HAVE_XARF = orig_flag
 			xarfreport._build_login_attack_lib = orig_lib
+
+	def testDropsReportOnLibValidationRejection(self):
+		# When the lib validates and rejects the data (e.g. a genuinely
+		# missing required field), no report should be sent at all - not
+		# even the unvalidated stdlib version of the same broken data.
+		orig_flag = xarfreport._HAVE_XARF
+		orig_lib = xarfreport._build_login_attack_lib
+		try:
+			xarfreport._HAVE_XARF = True
+			def reject(data):
+				raise xarfreport.XarfValidationError(
+					"xarf validation failed: "
+					"[\"'source_port' is a required property\"]")
+			xarfreport._build_login_attack_lib = reject
+			r = xarfreport.build_login_attack(self._data())
+			self.assertIsNone(r)
+			self.assertLogged("rejected report as schema-invalid")
+		finally:
+			xarfreport._HAVE_XARF = orig_flag
+			xarfreport._build_login_attack_lib = orig_lib
+
+
+class XarfImportGuardTest(LogCaptureTestCase):
+
+	def testHaveXarfFalseOnBrokenImport(self):
+		# A broken/incompatible `xarf` install (e.g. a pydantic version
+		# mismatch) can raise more than ImportError while `xarf` itself
+		# imports fine but blows up on attribute access; that must not
+		# crash the whole module import.
+		class _BrokenXarf(object):
+			def __getattr__(self, name):
+				raise RuntimeError("simulated broken xarf install")
+		orig_mod = sys.modules.get('xarf')
+		sys.modules['xarf'] = _BrokenXarf()
+		try:
+			importlib.reload(xarfreport)
+			self.assertFalse(xarfreport._HAVE_XARF)
+			self.assertLogged("xarf library unusable")
+		finally:
+			if orig_mod is not None:
+				sys.modules['xarf'] = orig_mod
+			else:
+				sys.modules.pop('xarf', None)
+			importlib.reload(xarfreport)
 
 
 class XarfV4ActionTest(LogCaptureTestCase):
@@ -269,6 +316,25 @@ class XarfV4ActionTest(LogCaptureTestCase):
 		self.assertNotIn('destination_port', d)
 		self.assertEqual(d['source_identifier'], '1.2.3.4')
 
+	def testAInfoToDataResolvesServiceName(self):
+		act = self._mk(port="ssh")
+		d = act._aInfoToData({'ip': '1.2.3.4', 'time': 1736597840,
+			'failures': 2, 'ipmatches': 'x'})
+		self.assertEqual(d['destination_port'], 22)
+
+	def testAInfoToDataCommaListUsesFirstEntry(self):
+		act = self._mk(port="http,https")
+		d = act._aInfoToData({'ip': '1.2.3.4', 'time': 1736597840,
+			'failures': 2, 'ipmatches': 'x'})
+		self.assertEqual(d['destination_port'], 80)
+
+	def testAInfoToDataOmitsZeroPort(self):
+		# port="0" "parses" but 0 violates the schema's minimum of 1.
+		act = self._mk(port="0")
+		d = act._aInfoToData({'ip': '1.2.3.4', 'time': 1736597840,
+			'failures': 2, 'ipmatches': 'x'})
+		self.assertNotIn('destination_port', d)
+
 	def testAInfoExtractsSourcePortFromSshdLine(self):
 		act = self._mk(port="22")
 		d = act._aInfoToData({'ip': '203.0.113.5', 'time': 1736597840,
@@ -290,6 +356,86 @@ class XarfV4ActionTest(LogCaptureTestCase):
 			'failures': 2,
 			'ipmatches': 'from 203.0.113.5 port 1111 ssh2\nfrom 203.0.113.5 port 2222 ssh2'})
 		self.assertEqual(d['source_port'], 2222)
+
+	def testAInfoSourcePortIgnoresServicePortInVerboseLine(self):
+		# LogLevel VERBOSE sshd logs both the attacker's port and the local
+		# listening port on the same line; only the one next to the
+		# attacker's own IP is the attacker's source port.
+		act = self._mk(port="22")
+		d = act._aInfoToData({'ip': '115.249.163.77', 'time': 1736597840,
+			'failures': 1,
+			'ipmatches':
+				'Connection from 115.249.163.77 port 51353 on 127.0.0.1 port 22'})
+		self.assertEqual(d['source_port'], 51353)
+
+	def testBanSkipsWhenNoEvidence(self):
+		# e.g. `fail2ban-client set <jail> banip <ip>`: no log evidence at
+		# all, nothing to substantiate a complaint.
+		act = self._mk()
+		sent = []
+		act._resolveAbuseContacts = lambda ip: ["abuse@isp.example"]
+		act._sendmail = lambda recipients, msg: sent.append((recipients, msg))
+		act.ban({'ip': '87.142.124.10', 'failures': 0, 'time': 1736597840,
+			'ipmatches': []})
+		self.assertEqual(sent, [])
+		self.assertLogged("no evidence")
+
+	def testBanSkipsWhenReportFailsValidation(self):
+		act = self._mk()
+		sent = []
+		act._resolveAbuseContacts = lambda ip: ["abuse@isp.example"]
+		act._sendmail = lambda recipients, msg: sent.append((recipients, msg))
+		orig = xarfreport.build_login_attack
+		xarfreport.build_login_attack = lambda data: None
+		try:
+			act.ban({'ip': '87.142.124.10', 'failures': 3,
+				'time': 1736597840, 'ipmatches': 'log line'})
+		finally:
+			xarfreport.build_login_attack = orig
+		self.assertEqual(sent, [])
+		self.assertLogged("failed schema validation; not sending")
+
+	def testSendmailPassesEnvelopeFromFlagByDefault(self):
+		act = self._mk(sender="fail2ban@example.com")
+		captured = {}
+		class FakeProc(object):
+			def __init__(self, cmd, **kw):
+				captured['cmd'] = cmd
+				self.returncode = 0
+			def communicate(self, data=None, timeout=None):
+				return (b'', b'')
+		orig_popen = subprocess.Popen
+		subprocess.Popen = FakeProc
+		try:
+			act._sendmail(["abuse@isp.example"],
+				act._build_email({"source_identifier": "1.2.3.4"}))
+		finally:
+			subprocess.Popen = orig_popen
+		self.assertIn('-f', captured['cmd'])
+		self.assertEqual(
+			captured['cmd'][captured['cmd'].index('-f') + 1],
+			"fail2ban@example.com")
+
+	def testSendmailRespectsMailargsOverride(self):
+		act = self._mk(mailargs="-oi -f custom@example.com")
+		captured = {}
+		class FakeProc(object):
+			def __init__(self, cmd, **kw):
+				captured['cmd'] = cmd
+				self.returncode = 0
+			def communicate(self, data=None, timeout=None):
+				return (b'', b'')
+		orig_popen = subprocess.Popen
+		subprocess.Popen = FakeProc
+		try:
+			act._sendmail(["abuse@isp.example"],
+				act._build_email({"source_identifier": "1.2.3.4"}))
+		finally:
+			subprocess.Popen = orig_popen
+		self.assertEqual(
+			captured['cmd'][captured['cmd'].index('-f') + 1],
+			"custom@example.com")
+		self.assertIn('-oi', captured['cmd'])
 
 	def testBanNoContactNoSend(self):
 		act = self._mk()
