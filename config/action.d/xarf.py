@@ -31,20 +31,177 @@ action where you are confident the activity is genuinely abusive, e.g.:
   * filters with a low likelihood of false positives.
 """
 
+import base64
+import hashlib
 import json
 import re
 import shlex
 import socket
 import subprocess
 import time
+import uuid
 from email import encoders
 from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import formatdate, make_msgid
 
+from fail2ban.helpers import getLogger
 from fail2ban.server.actions import ActionBase
-from fail2ban.server import xarfreport
+
+# Loaded standalone (see Utils.load_python_module), so __name__ is just
+# "xarf" - name explicitly under the fail2ban.* hierarchy so it reaches
+# the daemon's configured log handlers (and the test log capture).
+logSys = getLogger("fail2ban.xarf")
+
+# --- XARF v4 report generator -----------------------------------------
+#
+# Builds the XARF v4 login_attack document from fail2ban ban data. Kept
+# local to this action (its only consumer today) rather than in
+# fail2ban/server/: if a second XARF-based transport needs it later, it
+# can be extracted then.
+#
+# Uses the official ``xarf`` library when importable (full schema
+# validation and spec-tracking); otherwise falls back to a stdlib-only
+# builder that produces the same document shape.
+
+try:
+	import xarf as _xarf
+	# Only use the library when it exposes the expected XARF v4 generator API
+	# (guards against an unrelated/older package squatting the `xarf` name).
+	_HAVE_XARF = hasattr(_xarf, "create_report") and hasattr(_xarf, "create_evidence")
+except Exception as e:  # pragma: no cover - depends on optional install
+	# Broad on purpose: a broken/incompatible install (e.g. a pydantic
+	# version mismatch) can raise more than ImportError at import time, and
+	# that must not take down the whole action - fall back to the stdlib
+	# builder instead.
+	logSys.warning("xarf library unusable (%s: %s); using stdlib builder",
+		type(e).__name__, e)
+	_xarf = None
+	_HAVE_XARF = False
+
+# Pinned fallback spec version used by the stdlib builder when the
+# official ``xarf`` library is not installed.
+XARF_VERSION_FALLBACK = "4.2.0"
+CATEGORY = "connection"
+TYPE = "login_attack"
+
+
+class XarfValidationError(Exception):
+	"""Raised when the xarf library validated a report and rejected it.
+
+	Kept distinct from other failures (missing dependency, unexpected
+	library errors) so build_login_attack() can choose not to send a
+	document the library has already told us is schema-invalid, rather
+	than silently shipping the same data unvalidated via the stdlib
+	fallback.
+	"""
+
+
+def _build_evidence_stdlib(text, description=None):
+	"""Return a single XARF v4 evidence item for a block of log text."""
+	raw = text.encode('utf-8')
+	ev = {
+		"content_type": "text/plain",
+		"payload": base64.b64encode(raw).decode('ascii'),
+		"hash": "sha256:" + hashlib.sha256(raw).hexdigest(),
+		"size": len(raw),
+	}
+	if description is not None:
+		ev["description"] = description
+	return ev
+
+
+def _build_login_attack_stdlib(data):
+	"""Build a XARF v4 login_attack report dict using only the stdlib."""
+	report = {
+		"xarf_version": XARF_VERSION_FALLBACK,
+		"report_id": str(uuid.uuid4()),
+		"timestamp": data["timestamp"],
+		"reporter": dict(data["reporter"]),
+		"sender": dict(data["sender"]),
+		"source_identifier": data["source_identifier"],
+		"category": CATEGORY,
+		"type": TYPE,
+		"protocol": data["protocol"],
+		"first_seen": data["first_seen"],
+	}
+	# optional fields — include only when present and not None:
+	for key in ("evidence_source", "service", "destination_ip",
+			"destination_port", "source_port", "attempt_count"):
+		val = data.get(key)
+		if val is not None:
+			report[key] = val
+	evtext = data.get("evidence_text")
+	if evtext:
+		report["evidence"] = [
+			_build_evidence_stdlib(evtext, description="fail2ban log matches")]
+	return report
+
+
+def _build_login_attack_lib(data):
+	"""Build + validate a login_attack report via the official xarf lib."""
+	kwargs = {
+		"protocol": data["protocol"],
+		"first_seen": data["first_seen"],
+		"timestamp": data["timestamp"],
+	}
+	for key in ("evidence_source", "service", "destination_ip",
+			"destination_port", "source_port", "attempt_count"):
+		val = data.get(key)
+		if val is not None:
+			kwargs[key] = val
+	evtext = data.get("evidence_text")
+	if evtext:
+		kwargs["evidence"] = [_xarf.create_evidence(
+			"text/plain", evtext, description="fail2ban log matches")]
+	result = _xarf.create_report(
+		category=CATEGORY,
+		type=TYPE,
+		source_identifier=data["source_identifier"],
+		reporter=dict(data["reporter"]),
+		sender=dict(data["sender"]),
+		**kwargs)
+	if result.errors or result.report is None:
+		raise XarfValidationError(
+			"xarf validation failed: %r" % (result.errors,))
+	report = result.report.model_dump(by_alias=True, exclude_none=True)
+	# create_report() stamps `timestamp` with its own value (now) rather than
+	# honoring the one we pass in, leaving the document internally
+	# inconsistent with `first_seen`; enforce the ban-time timestamp we were
+	# given.
+	report["timestamp"] = data["timestamp"]
+	return report
+
+
+def build_login_attack(data):
+	"""Return a XARF v4 login_attack report dict from fail2ban ban data, or
+	None if the report is known to be schema-invalid.
+
+	Uses the official ``xarf`` library when available. If the library
+	itself is unavailable or fails unexpectedly, falls back to the stdlib
+	builder so a report is still produced (availability over strictness).
+	If the library successfully validates the data and rejects it as
+	non-conformant, no report is returned at all: sending a document the
+	library has already flagged as invalid would be worse than not
+	reporting.
+	"""
+	if _HAVE_XARF:
+		try:
+			return _build_login_attack_lib(data)
+		except XarfValidationError as e:
+			logSys.error(
+				"xarf library rejected report as schema-invalid (%s); "
+				"not sending an unvalidated fallback", e)
+			return None
+		except Exception as e:  # noqa: broad - never block reporting
+			logSys.warning(
+				"xarf library report build failed (%s: %s); "
+				"falling back to stdlib builder", type(e).__name__, e)
+	return _build_login_attack_stdlib(data)
+
+
+# --- XARF v4 email action -----------------------------------------
 
 # Strict address validation for abuse contacts resolved from DNS (untrusted):
 # rejects anything that is not an email and anything that could be an argv flag.
@@ -283,7 +440,7 @@ class XarfV4Action(ActionBase):
 			return
 		try:
 			data = self._aInfoToData(aInfo)
-			report = xarfreport.build_login_attack(data)
+			report = build_login_attack(data)
 			if report is None:
 				# the xarf library validated the report and rejected it as
 				# schema-invalid; sending it unvalidated would be worse than

@@ -23,22 +23,33 @@ __license__ = "GPL"
 
 import base64
 import hashlib
-import importlib
 import os
 import subprocess
 import sys
 import unittest
 
-from ...server import xarfreport
 from ..dummyjail import DummyJail
 from ..utils import CONFIG_DIR, Utils, LogCaptureTestCase
+
+_ACTFILE = os.path.join(CONFIG_DIR, "action.d", "xarf.py")
+
+try:
+	import xarf as _xarf_lib
+	_HAVE_XARF_LIB = (hasattr(_xarf_lib, "create_report")
+		and hasattr(_xarf_lib, "create_evidence"))
+except Exception:
+	_HAVE_XARF_LIB = False
 
 
 class XarfEvidenceTest(unittest.TestCase):
 
+	@classmethod
+	def setUpClass(cls):
+		cls.mod = Utils.load_python_module(_ACTFILE)
+
 	def testBuildEvidenceStdlib(self):
 		text = "Dec 31 11:59:59 sshd: auth failure from 87.142.124.10"
-		ev = xarfreport._build_evidence_stdlib(text, description="logs")
+		ev = self.mod._build_evidence_stdlib(text, description="logs")
 		self.assertEqual(ev['content_type'], "text/plain")
 		self.assertEqual(ev['description'], "logs")
 		# payload is base64 of the utf-8 text:
@@ -50,12 +61,16 @@ class XarfEvidenceTest(unittest.TestCase):
 		self.assertEqual(ev['size'], len(text.encode('utf-8')))
 
 	def testBuildEvidenceStdlibNoDescription(self):
-		ev = xarfreport._build_evidence_stdlib("a log line")
+		ev = self.mod._build_evidence_stdlib("a log line")
 		self.assertNotIn('description', ev)
 		self.assertEqual(ev['content_type'], "text/plain")
 
 
 class XarfLoginAttackStdlibTest(LogCaptureTestCase):
+
+	@classmethod
+	def setUpClass(cls):
+		cls.mod = Utils.load_python_module(_ACTFILE)
 
 	def _data(self, **over):
 		data = {
@@ -78,8 +93,8 @@ class XarfLoginAttackStdlibTest(LogCaptureTestCase):
 		return data
 
 	def testBuildLoginAttackStdlib(self):
-		r = xarfreport._build_login_attack_stdlib(self._data())
-		self.assertEqual(r['xarf_version'], xarfreport.XARF_VERSION_FALLBACK)
+		r = self.mod._build_login_attack_stdlib(self._data())
+		self.assertEqual(r['xarf_version'], self.mod.XARF_VERSION_FALLBACK)
 		self.assertEqual(r['category'], "connection")
 		self.assertEqual(r['type'], "login_attack")
 		self.assertEqual(r['source_identifier'], "87.142.124.10")
@@ -101,7 +116,7 @@ class XarfLoginAttackStdlibTest(LogCaptureTestCase):
 		data = self._data()
 		del data['destination_port']
 		del data['attempt_count']
-		r = xarfreport._build_login_attack_stdlib(data)
+		r = self.mod._build_login_attack_stdlib(data)
 		self.assertNotIn('destination_port', r)
 		self.assertNotIn('attempt_count', r)
 		self.assertIn('source_identifier', r)
@@ -114,7 +129,7 @@ class XarfBuildLoginAttackTest(XarfLoginAttackStdlibTest):
 	def testPublicEntryPointReturnsValidShape(self):
 		# Regardless of whether the lib is present, the public function
 		# returns a dict with the required v4 fields.
-		r = xarfreport.build_login_attack(self._data())
+		r = self.mod.build_login_attack(self._data())
 		for field in ("xarf_version", "report_id", "timestamp", "reporter",
 				"sender", "source_identifier", "category", "type",
 				"protocol", "first_seen"):
@@ -122,49 +137,49 @@ class XarfBuildLoginAttackTest(XarfLoginAttackStdlibTest):
 		self.assertEqual(r['category'], "connection")
 		self.assertEqual(r['type'], "login_attack")
 
-	@unittest.skipUnless(xarfreport._HAVE_XARF, "xarf library not installed")
+	@unittest.skipUnless(_HAVE_XARF_LIB, "xarf library not installed")
 	def testLibPathValidatesAgainstSchema(self):
 		# When the lib is present, output must pass xarf's own validation.
 		import xarf
-		r = xarfreport.build_login_attack(self._data())
+		r = self.mod.build_login_attack(self._data())
 		result = xarf.parse(r)
 		self.assertEqual(result.errors, [])
 
 	def testFallbackOnLibError(self):
 		# Force the lib path to raise; expect a clean fallback + warning.
-		orig_flag = xarfreport._HAVE_XARF
-		orig_lib = xarfreport._build_login_attack_lib
+		orig_flag = self.mod._HAVE_XARF
+		orig_lib = self.mod._build_login_attack_lib
 		try:
-			xarfreport._HAVE_XARF = True
+			self.mod._HAVE_XARF = True
 			def boom(data):
 				raise RuntimeError("simulated lib failure")
-			xarfreport._build_login_attack_lib = boom
-			r = xarfreport.build_login_attack(self._data())
+			self.mod._build_login_attack_lib = boom
+			r = self.mod.build_login_attack(self._data())
 			self.assertEqual(r['type'], "login_attack")
 			self.assertLogged("falling back to stdlib")
 		finally:
-			xarfreport._HAVE_XARF = orig_flag
-			xarfreport._build_login_attack_lib = orig_lib
+			self.mod._HAVE_XARF = orig_flag
+			self.mod._build_login_attack_lib = orig_lib
 
 	def testDropsReportOnLibValidationRejection(self):
 		# When the lib validates and rejects the data (e.g. a genuinely
 		# missing required field), no report should be sent at all - not
 		# even the unvalidated stdlib version of the same broken data.
-		orig_flag = xarfreport._HAVE_XARF
-		orig_lib = xarfreport._build_login_attack_lib
+		orig_flag = self.mod._HAVE_XARF
+		orig_lib = self.mod._build_login_attack_lib
 		try:
-			xarfreport._HAVE_XARF = True
+			self.mod._HAVE_XARF = True
 			def reject(data):
-				raise xarfreport.XarfValidationError(
+				raise self.mod.XarfValidationError(
 					"xarf validation failed: "
 					"[\"'source_port' is a required property\"]")
-			xarfreport._build_login_attack_lib = reject
-			r = xarfreport.build_login_attack(self._data())
+			self.mod._build_login_attack_lib = reject
+			r = self.mod.build_login_attack(self._data())
 			self.assertIsNone(r)
 			self.assertLogged("rejected report as schema-invalid")
 		finally:
-			xarfreport._HAVE_XARF = orig_flag
-			xarfreport._build_login_attack_lib = orig_lib
+			self.mod._HAVE_XARF = orig_flag
+			self.mod._build_login_attack_lib = orig_lib
 
 
 class XarfImportGuardTest(LogCaptureTestCase):
@@ -180,15 +195,14 @@ class XarfImportGuardTest(LogCaptureTestCase):
 		orig_mod = sys.modules.get('xarf')
 		sys.modules['xarf'] = _BrokenXarf()
 		try:
-			importlib.reload(xarfreport)
-			self.assertFalse(xarfreport._HAVE_XARF)
+			mod = Utils.load_python_module(_ACTFILE)
+			self.assertFalse(mod._HAVE_XARF)
 			self.assertLogged("xarf library unusable")
 		finally:
 			if orig_mod is not None:
 				sys.modules['xarf'] = orig_mod
 			else:
 				sys.modules.pop('xarf', None)
-			importlib.reload(xarfreport)
 
 
 class XarfV4ActionTest(LogCaptureTestCase):
@@ -196,9 +210,8 @@ class XarfV4ActionTest(LogCaptureTestCase):
 	def setUp(self):
 		super(XarfV4ActionTest, self).setUp()
 		self.__jail = DummyJail()
-		actfile = os.path.join(CONFIG_DIR, "action.d", "xarf.py")
-		mod = Utils.load_python_module(actfile)
-		self.Action = mod.Action
+		self.mod = Utils.load_python_module(_ACTFILE)
+		self.Action = self.mod.Action
 
 	def _mk(self, **over):
 		opts = dict(
@@ -385,13 +398,13 @@ class XarfV4ActionTest(LogCaptureTestCase):
 		sent = []
 		act._resolveAbuseContacts = lambda ip: ["abuse@isp.example"]
 		act._sendmail = lambda recipients, msg: sent.append((recipients, msg))
-		orig = xarfreport.build_login_attack
-		xarfreport.build_login_attack = lambda data: None
+		orig = self.mod.build_login_attack
+		self.mod.build_login_attack = lambda data: None
 		try:
 			act.ban({'ip': '87.142.124.10', 'failures': 3,
 				'time': 1736597840, 'ipmatches': 'log line'})
 		finally:
-			xarfreport.build_login_attack = orig
+			self.mod.build_login_attack = orig
 		self.assertEqual(sent, [])
 		self.assertLogged("failed schema validation; not sending")
 
